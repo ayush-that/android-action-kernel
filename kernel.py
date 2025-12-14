@@ -2,7 +2,8 @@ import os
 import time
 import subprocess
 import json
-from typing import Dict, Any, List, Optional
+import inspect
+from typing import Dict, Any, List, Optional, Callable, Union, get_origin, get_args
 from openai import OpenAI
 import sanitizer
 from dotenv import load_dotenv
@@ -15,6 +16,91 @@ LOCAL_DUMP_PATH = "window_dump.xml"
 
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+class FunctionRegistry:
+    def __init__(self):
+        self.functions: Dict[str, Callable] = {}
+        self.schemas: List[Dict[str, Any]] = []
+
+    def _get_type_schema(self, annotation: Any) -> Dict[str, Any]:
+        origin = get_origin(annotation)
+        if origin is Union:
+            args = get_args(annotation)
+            non_none_args = [arg for arg in args if arg is not type(None)]
+            if non_none_args:
+                return self._get_type_schema(non_none_args[0])
+
+        if annotation == str:
+            return {"type": "string"}
+        elif annotation == int:
+            return {"type": "integer"}
+        elif annotation == float:
+            return {"type": "number"}
+        elif annotation == bool:
+            return {"type": "boolean"}
+        else:
+            return {"type": "string"}
+
+    def _generate_schema(self, func: Callable, description: str) -> Dict[str, Any]:
+        sig = inspect.signature(func)
+        properties = {}
+        required = []
+
+        for param_name, param in sig.parameters.items():
+            if param_name == "self":
+                continue
+
+            param_type = (
+                param.annotation if param.annotation != inspect.Parameter.empty else str
+            )
+            param_desc = param_name.replace("_", " ").title()
+
+            prop_schema = self._get_type_schema(param_type)
+            prop_schema["description"] = param_desc
+
+            if param.default != inspect.Parameter.empty:
+                prop_schema["default"] = param.default
+            else:
+                origin = get_origin(param_type)
+                if origin is not Union or type(None) not in get_args(param_type):
+                    required.append(param_name)
+
+            properties[param_name] = prop_schema
+
+        params_schema = {
+            "type": "object",
+            "properties": properties,
+        }
+        if required:
+            params_schema["required"] = required
+
+        return {
+            "type": "function",
+            "function": {
+                "name": func.__name__,
+                "description": description,
+                "parameters": params_schema,
+            },
+        }
+
+    def register(self, description: str):
+        def decorator(func: Callable):
+            self.functions[func.__name__] = func
+            schema = self._generate_schema(func, description)
+            self.schemas.append(schema)
+            return func
+
+        return decorator
+
+    def get_functions(self) -> List[Dict[str, Any]]:
+        return self.schemas
+
+    def get_function_map(self) -> Dict[str, Callable]:
+        return self.functions
+
+
+registry = FunctionRegistry()
 
 
 def escape_text_for_adb(text: str) -> str:
@@ -55,6 +141,7 @@ def get_screen_state() -> str:
 
 
 # Android action functions
+@registry.register("Tap on the Android screen at the given coordinates")
 def android_tap(x: int, y: int) -> str:
     print(f"Tapping: ({x}, {y})")
     run_adb_command(["shell", "input", "tap", str(x), str(y)])
@@ -62,6 +149,9 @@ def android_tap(x: int, y: int) -> str:
     return f"Tapped at ({x}, {y})"
 
 
+@registry.register(
+    "Type text into the Android device. Optionally provide coordinates to focus a text field first."
+)
 def android_type(text: str, x: Optional[int] = None, y: Optional[int] = None) -> str:
     if x is not None and y is not None:
         print(f"Focusing text field at: ({x}, {y})")
@@ -75,6 +165,7 @@ def android_type(text: str, x: Optional[int] = None, y: Optional[int] = None) ->
     return f"Typed: {text}"
 
 
+@registry.register("Navigate to the Android home screen")
 def android_home() -> str:
     print("Going Home")
     run_adb_command(["shell", "input", "keyevent", "KEYCODE_HOME"])
@@ -82,6 +173,7 @@ def android_home() -> str:
     return "Navigated to home screen"
 
 
+@registry.register("Press the back button on Android")
 def android_back() -> str:
     print("Going Back")
     run_adb_command(["shell", "input", "keyevent", "KEYCODE_BACK"])
@@ -89,6 +181,7 @@ def android_back() -> str:
     return "Went back"
 
 
+@registry.register("Wait for a specified number of seconds")
 def android_wait(seconds: float = 2.0) -> str:
     print(f"Waiting {seconds} seconds...")
     time.sleep(seconds)
@@ -96,6 +189,7 @@ def android_wait(seconds: float = 2.0) -> str:
 
 
 # Host-side functions
+@registry.register("Read a file from the host machine")
 def host_read_file(filepath: str) -> str:
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -105,6 +199,7 @@ def host_read_file(filepath: str) -> str:
         return f"Error reading file: {str(e)}"
 
 
+@registry.register("Write content to a file on the host machine")
 def host_write_file(filepath: str, content: str) -> str:
     try:
         with open(filepath, "w", encoding="utf-8") as f:
@@ -114,6 +209,7 @@ def host_write_file(filepath: str, content: str) -> str:
         return f"Error writing file: {str(e)}"
 
 
+@registry.register("Run a shell command on the host machine")
 def host_run_command(command: str) -> str:
     try:
         result = subprocess.run(
@@ -129,6 +225,7 @@ def host_run_command(command: str) -> str:
         return f"Error running command: {str(e)}"
 
 
+@registry.register("List contents of a directory on the host machine")
 def host_list_directory(directory: str = ".") -> str:
     try:
         items = os.listdir(directory)
@@ -137,182 +234,16 @@ def host_list_directory(directory: str = ".") -> str:
         return f"Error listing directory: {str(e)}"
 
 
+@registry.register(
+    "Call this when the task is complete. Provide a summary of what was accomplished."
+)
 def task_complete(summary: str) -> str:
     print(f"\n✓ Task Complete: {summary}")
     return "TASK_COMPLETE"
 
 
-FUNCTIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "android_tap",
-            "description": "Tap on the Android screen at the given coordinates",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "x": {"type": "integer", "description": "X coordinate"},
-                    "y": {"type": "integer", "description": "Y coordinate"},
-                },
-                "required": ["x", "y"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "android_type",
-            "description": "Type text into the Android device. Optionally provide coordinates to focus a text field first.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Text to type"},
-                    "x": {
-                        "type": "integer",
-                        "description": "X coordinate of text field (optional)",
-                    },
-                    "y": {
-                        "type": "integer",
-                        "description": "Y coordinate of text field (optional)",
-                    },
-                },
-                "required": ["text"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "android_home",
-            "description": "Navigate to the Android home screen",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "android_back",
-            "description": "Press the back button on Android",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "android_wait",
-            "description": "Wait for a specified number of seconds",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "seconds": {
-                        "type": "number",
-                        "description": "Seconds to wait",
-                        "default": 2.0,
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "host_read_file",
-            "description": "Read a file from the host machine",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Path to the file to read",
-                    },
-                },
-                "required": ["filepath"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "host_write_file",
-            "description": "Write content to a file on the host machine",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "filepath": {
-                        "type": "string",
-                        "description": "Path to the file to write",
-                    },
-                    "content": {"type": "string", "description": "Content to write"},
-                },
-                "required": ["filepath", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "host_run_command",
-            "description": "Run a shell command on the host machine",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Shell command to execute",
-                    },
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "host_list_directory",
-            "description": "List contents of a directory on the host machine",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "directory": {
-                        "type": "string",
-                        "description": "Directory path (default: current directory)",
-                        "default": ".",
-                    },
-                },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "task_complete",
-            "description": "Call this when the task is complete. Provide a summary of what was accomplished.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "Summary of what was accomplished",
-                    },
-                },
-                "required": ["summary"],
-            },
-        },
-    },
-]
-
-FUNCTION_MAP = {
-    "android_tap": android_tap,
-    "android_type": android_type,
-    "android_home": android_home,
-    "android_back": android_back,
-    "android_wait": android_wait,
-    "host_read_file": host_read_file,
-    "host_write_file": host_write_file,
-    "host_run_command": host_run_command,
-    "host_list_directory": host_list_directory,
-    "task_complete": task_complete,
-}
+FUNCTIONS = registry.get_functions()
+FUNCTION_MAP = registry.get_function_map()
 
 
 def run_agent(goal: str, max_iterations: int = 50):

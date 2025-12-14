@@ -181,6 +181,14 @@ def android_back() -> str:
     return "Went back"
 
 
+@registry.register("Swipe on the Android screen from start coordinates to end coordinates")
+def android_swipe(x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> str:
+    print(f"Swiping from ({x1}, {y1}) to ({x2}, {y2})")
+    run_adb_command(["shell", "input", "swipe", str(x1), str(y1), str(x2), str(y2), str(duration_ms)])
+    time.sleep(0.5)
+    return f"Swiped from ({x1}, {y1}) to ({x2}, {y2})"
+
+
 @registry.register("Wait for a specified number of seconds")
 def android_wait(seconds: float = 2.0) -> str:
     print(f"Waiting {seconds} seconds...")
